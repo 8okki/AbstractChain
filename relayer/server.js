@@ -36,6 +36,14 @@ try {
 
 const contract = new ethers.Contract(CONTRACT_ADDRESS, contractAbi, relayerWallet);
 
+// Minimal ERC20 ABI to query external token details
+const ERC20_ABI = [
+    "function name() view returns (string)",
+    "function symbol() view returns (string)",
+    "function decimals() view returns (uint8)",
+    "function balanceOf(address) view returns (uint256)"
+];
+
 // Initialize server information console logs
 console.log("\x1b[36m==================================================\x1b[0m");
 console.log("\x1b[32m       Gas Relayer Server Initialization          \x1b[0m");
@@ -65,20 +73,28 @@ app.use((req, res, next) => {
 });
 
 /**
- * GET /api/info
- * Returns contract details, current token price, and general configuration
+ * GET /api/info/:token
+ * Returns contract details, current token price, and general configuration for the specific ERC20 token
  */
-app.get('/api/info', async (req, res) => {
+app.get('/api/info/:token', async (req, res) => {
+    const { token } = req.params;
+
+    if (!ethers.isAddress(token)) {
+        return res.status(400).json({ error: "Invalid token address format" });
+    }
+
     try {
+        const tokenContract = new ethers.Contract(token, ERC20_ABI, provider);
         const [price, dec, name, symbol] = await Promise.all([
-            contract.tokenPriceInWei(),
-            contract.decimals(),
-            contract.name(),
-            contract.symbol()
+            contract.tokenPricesInWei(token),
+            tokenContract.decimals(),
+            tokenContract.name(),
+            tokenContract.symbol()
         ]);
 
         return res.json({
-            contractAddress: CONTRACT_ADDRESS,
+            bridgeAddress: CONTRACT_ADDRESS,
+            tokenAddress: token,
             tokenName: name,
             tokenSymbol: symbol,
             tokenDecimals: Number(dec),
@@ -86,8 +102,8 @@ app.get('/api/info', async (req, res) => {
             relayerAddress: relayerWallet.address
         });
     } catch (error) {
-        console.error("Error fetching info:", error);
-        return res.status(500).json({ error: "Failed to fetch contract configuration details", message: error.message });
+        console.error(`Error fetching info for token ${token}:`, error);
+        return res.status(500).json({ error: "Failed to fetch token configuration details", message: error.message });
     }
 });
 
@@ -120,6 +136,7 @@ app.get('/api/nonce/:address', async (req, res) => {
  */
 app.post('/api/transfer', async (req, res) => {
     const {
+        token,
         owner,
         recipient,
         amount,
@@ -127,29 +144,37 @@ app.post('/api/transfer', async (req, res) => {
         gasLimit,
         nonce,
         deadline,
-        signature
+        permitV,
+        permitR,
+        permitS,
+        signature // bridge signature
     } = req.body;
 
     // 1. Basic validation of inputs
-    if (!owner || !recipient || !signature) {
+    if (!token || !owner || !recipient || !signature) {
         return res.status(400).json({ error: "Missing required string/address/signature parameters." });
     }
 
-    if (!ethers.isAddress(owner) || !ethers.isAddress(recipient)) {
-        return res.status(400).json({ error: "Owner and recipient must be valid Ethereum addresses." });
+    if (!ethers.isAddress(token) || !ethers.isAddress(owner) || !ethers.isAddress(recipient)) {
+        return res.status(400).json({ error: "Token, owner and recipient must be valid Ethereum addresses." });
     }
 
     if (!signature.startsWith('0x') || signature.length < 130) {
         return res.status(400).json({ error: "Signature must be a valid hex string." });
     }
 
-    let parsedAmount, parsedFee, parsedGasLimit, parsedNonce, parsedDeadline;
+    if (permitR === undefined || permitS === undefined || permitV === undefined) {
+        return res.status(400).json({ error: "Missing standard ERC20 permit signature parameters (permitV, permitR, permitS)." });
+    }
+
+    let parsedAmount, parsedFee, parsedGasLimit, parsedNonce, parsedDeadline, parsedPermitV;
     try {
         parsedAmount = safeBigInt(amount, 'amount');
         parsedFee = safeBigInt(fee, 'fee');
         parsedGasLimit = safeBigInt(gasLimit, 'gasLimit');
         parsedNonce = safeBigInt(nonce, 'nonce');
         parsedDeadline = safeBigInt(deadline, 'deadline');
+        parsedPermitV = Number(permitV);
     } catch (err) {
         return res.status(400).json({ error: err.message });
     }
@@ -164,12 +189,13 @@ app.post('/api/transfer', async (req, res) => {
     }
 
     try {
-        // Fetch contract details
-        const decimals = await contract.decimals();
-        const tokenPriceInWei = await contract.tokenPriceInWei();
+        // Fetch contract details dynamically for the target token
+        const tokenContract = new ethers.Contract(token, ERC20_ABI, provider);
+        const decimals = await tokenContract.decimals();
+        const tokenPriceInWei = await contract.tokenPricesInWei(token);
 
         if (tokenPriceInWei === 0n) {
-            return res.status(500).json({ error: "GaslessTransferBridge: token price in Wei is not set on the contract" });
+            return res.status(400).json({ error: `GaslessTransferBridge: token price in Wei for ${token} is not set on the contract` });
         }
 
         // 3. Backend fee sanity check based on current block baseFee (or gasPrice)
@@ -197,9 +223,10 @@ app.post('/api/transfer', async (req, res) => {
         }
 
         // 4. Simulate the transaction using estimateGas (revert checks)
-        console.log(`[Simulating] Simulating transfer of ${parsedAmount} from ${owner} to ${recipient}...`);
+        console.log(`[Simulating] Simulating transfer of ${parsedAmount} ${token} from ${owner} to ${recipient}...`);
         try {
             await contract.gaslessTransfer.estimateGas(
+                token,
                 owner,
                 recipient,
                 parsedAmount,
@@ -207,6 +234,9 @@ app.post('/api/transfer', async (req, res) => {
                 parsedGasLimit,
                 parsedNonce,
                 parsedDeadline,
+                parsedPermitV,
+                permitR,
+                permitS,
                 signature
             );
         } catch (simError) {
@@ -220,6 +250,7 @@ app.post('/api/transfer', async (req, res) => {
         // 5. Send transaction
         console.log(`[Executing] Sending gaslessTransfer on-chain...`);
         const tx = await contract.gaslessTransfer(
+            token,
             owner,
             recipient,
             parsedAmount,
@@ -227,6 +258,9 @@ app.post('/api/transfer', async (req, res) => {
             parsedGasLimit,
             parsedNonce,
             parsedDeadline,
+            parsedPermitV,
+            permitR,
+            permitS,
             signature
         );
 
@@ -256,6 +290,7 @@ app.post('/api/transfer', async (req, res) => {
  */
 app.post('/api/bridge', async (req, res) => {
     const {
+        token,
         owner,
         recipient,
         amount,
@@ -264,23 +299,30 @@ app.post('/api/bridge', async (req, res) => {
         gasLimit,
         nonce,
         deadline,
-        signature
+        permitV,
+        permitR,
+        permitS,
+        signature // bridge signature
     } = req.body;
 
     // 1. Basic validation of inputs
-    if (!owner || !recipient || !signature) {
+    if (!token || !owner || !recipient || !signature) {
         return res.status(400).json({ error: "Missing required string/address/signature parameters." });
     }
 
-    if (!ethers.isAddress(owner) || !ethers.isAddress(recipient)) {
-        return res.status(400).json({ error: "Owner and recipient must be valid Ethereum addresses." });
+    if (!ethers.isAddress(token) || !ethers.isAddress(owner) || !ethers.isAddress(recipient)) {
+        return res.status(400).json({ error: "Token, owner and recipient must be valid Ethereum addresses." });
     }
 
     if (!signature.startsWith('0x') || signature.length < 130) {
         return res.status(400).json({ error: "Signature must be a valid hex string." });
     }
 
-    let parsedAmount, parsedFee, parsedDestinationChainId, parsedGasLimit, parsedNonce, parsedDeadline;
+    if (permitR === undefined || permitS === undefined || permitV === undefined) {
+        return res.status(400).json({ error: "Missing standard ERC20 permit signature parameters (permitV, permitR, permitS)." });
+    }
+
+    let parsedAmount, parsedFee, parsedDestinationChainId, parsedGasLimit, parsedNonce, parsedDeadline, parsedPermitV;
     try {
         parsedAmount = safeBigInt(amount, 'amount');
         parsedFee = safeBigInt(fee, 'fee');
@@ -288,6 +330,7 @@ app.post('/api/bridge', async (req, res) => {
         parsedGasLimit = safeBigInt(gasLimit, 'gasLimit');
         parsedNonce = safeBigInt(nonce, 'nonce');
         parsedDeadline = safeBigInt(deadline, 'deadline');
+        parsedPermitV = Number(permitV);
     } catch (err) {
         return res.status(400).json({ error: err.message });
     }
@@ -302,12 +345,13 @@ app.post('/api/bridge', async (req, res) => {
     }
 
     try {
-        // Fetch contract details
-        const decimals = await contract.decimals();
-        const tokenPriceInWei = await contract.tokenPriceInWei();
+        // Fetch contract details dynamically for the target token
+        const tokenContract = new ethers.Contract(token, ERC20_ABI, provider);
+        const decimals = await tokenContract.decimals();
+        const tokenPriceInWei = await contract.tokenPricesInWei(token);
 
         if (tokenPriceInWei === 0n) {
-            return res.status(500).json({ error: "GaslessTransferBridge: token price in Wei is not set on the contract" });
+            return res.status(400).json({ error: `GaslessTransferBridge: token price in Wei for ${token} is not set on the contract` });
         }
 
         // 3. Backend fee sanity check based on current block baseFee (or gasPrice)
@@ -335,9 +379,10 @@ app.post('/api/bridge', async (req, res) => {
         }
 
         // 4. Simulate the transaction using estimateGas (revert checks)
-        console.log(`[Simulating] Simulating bridge of ${parsedAmount} from ${owner} to chain ${parsedDestinationChainId}...`);
+        console.log(`[Simulating] Simulating bridge of ${parsedAmount} ${token} from ${owner} to chain ${parsedDestinationChainId}...`);
         try {
             await contract.gaslessBridge.estimateGas(
+                token,
                 owner,
                 recipient,
                 parsedAmount,
@@ -346,6 +391,9 @@ app.post('/api/bridge', async (req, res) => {
                 parsedGasLimit,
                 parsedNonce,
                 parsedDeadline,
+                parsedPermitV,
+                permitR,
+                permitS,
                 signature
             );
         } catch (simError) {
@@ -359,6 +407,7 @@ app.post('/api/bridge', async (req, res) => {
         // 5. Send transaction
         console.log(`[Executing] Sending gaslessBridge on-chain...`);
         const tx = await contract.gaslessBridge(
+            token,
             owner,
             recipient,
             parsedAmount,
@@ -367,6 +416,9 @@ app.post('/api/bridge', async (req, res) => {
             parsedGasLimit,
             parsedNonce,
             parsedDeadline,
+            parsedPermitV,
+            permitR,
+            permitS,
             signature
         );
 
